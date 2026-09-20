@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Converted files
+input/
+output/
+*.epub
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/

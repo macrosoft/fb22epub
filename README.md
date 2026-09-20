@@ -39,6 +39,16 @@ If `output.epub` is omitted, the output is written next to the input with the sa
 
 The input can also be a `.zip` archive containing an FB2 file.
 
+## Interactive selector
+
+Pick a specific file from the `input/` folder and convert it to `output/`:
+
+```bash
+python convert.py
+```
+
+The tool lists all `.fb2`/`.zip` files found in `input/` (created automatically on first run). Enter a file number to convert it, or type a path to a file anywhere. After each conversion it returns to the list; type `q` to quit.
+
 ## As a script
 
 ```python
