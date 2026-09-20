@@ -1,0 +1,56 @@
+# fb22epub
+
+Convert FictionBook (FB2) e-books to EPUB 3 format with a single Python script.
+
+- No external dependencies required — works with the Python standard library.
+- Optional `lxml` and `Pillow` for better performance and image handling.
+- Preserves metadata, chapter structure, formatting, and images.
+
+## Features
+
+- **EPUB 3 output**: valid EPUB 3 package (OPF, XHTML content documents, `nav.xhtml` TOC, `container.xml`).
+- **Zero dependencies**: pure standard library baseline; `lxml` (faster parsing) and `Pillow` (image dimensions) are used only if installed.
+- **Metadata**: title, authors, language, genre, date, publisher, ISBN, and series name/number are carried over into the OPF metadata.
+- **Cover**: creates a cover page with an SVG wrapper that preserves the image aspect ratio; marks the cover in the manifest with `cover-image`.
+- **Images**: embedded and binary-linked images are extracted to `images/`; when duplicate ids exist, the highest-quality copy wins.
+- **Image dimension sniffing** without Pillow: built-in parsers for PNG, GIF, JPEG, WebP, and BMP.
+- **Structure**: chapters, sub-chapters, epigraphs, annotations, poems, quotes, tables, code blocks, subtitles, and notes (footnotes) are converted to styled XHTML.
+- **Footnote support**: `notes.xhtml` endnotes page with `epub:type` markup and `noteref` links.
+- **Frontmatter**: sections without a title at the beginning of the book (title page, copyright, annotation) are placed in frontmatter.
+- **Style**: included `style.css` for a reader-friendly layout.
+
+## Requirements
+
+- Python 3.6+
+
+Optional, for improved parsing and image handling:
+
+```bash
+pip install lxml Pillow
+```
+
+## Usage
+
+```bash
+python fb22epub.py <input.fb2> [output.epub]
+```
+
+If `output.epub` is omitted, the output is written next to the input with the same name and a `.epub` extension.
+
+The input can also be a `.zip` archive containing an FB2 file.
+
+## As a script
+
+```python
+from fb22epub import convert_fb2_to_epub
+
+convert_fb2_to_epub("book.fb2", "book.epub")
+```
+
+## Examples
+
+```bash
+python fb22epub.py "book.fb2"
+python fb22epub.py "book.fb2.zip"
+python fb22epub.py "in.fb2" "out.epub"
+```

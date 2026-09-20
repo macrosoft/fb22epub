@@ -1,0 +1,1061 @@
+#!/usr/bin/env python3
+"""
+Конвертер FB2 в EPUB 3.
+Зависимости: lxml, Pillow (опционально, для обработки изображений)
+pip install lxml Pillow
+"""
+import os
+import sys
+import uuid
+import zipfile
+import base64
+import mimetypes
+import re
+import struct
+from io import BytesIO
+from datetime import datetime, timezone
+from xml.etree import ElementTree as ET
+from pathlib import Path
+
+try:
+    from lxml import etree as lxml_etree
+    USE_LXML = True
+except ImportError:
+    USE_LXML = False
+
+# Пространства имён FB2
+FB2_NS = 'http://www.gribuser.ru/xml/fictionbook/2.0'
+XLINK_NS = 'http://www.w3.org/1999/xlink'
+FB2_NSMAP = {
+    'fb': FB2_NS,
+    'l': XLINK_NS,
+}
+
+# Пространства имён EPUB
+EPUB_CONTAINER_NS = 'urn:oasis:names:tc:opendocument:xmlns:container'
+OPF_NS = 'http://www.idpf.org/2007/opf'
+DC_NS = 'http://purl.org/dc/elements/1.1/'
+XHTML_NS = 'http://www.w3.org/1999/xhtml'
+EPUB_NS = 'http://www.idpf.org/2007/ops'
+
+def _image_dimensions(data):
+    """Размеры изображения (width, height) по бинарным данным.
+
+    Сначала пробует Pillow (если установлен), иначе парсит заголовки
+    вручную. Возвращает (None, None) при неизвестном формате.
+    """
+    if not data:
+        return (None, None)
+    try:
+        from PIL import Image
+        with Image.open(BytesIO(data)) as im:
+            return im.size
+    except Exception:
+        pass
+    return _sniff_image_size(data)
+
+def _image_quality(data):
+    """Оценка качества картинки: число пикселей или длина данных.
+
+    Используется для выбора лучшей копии, если в файле есть несколько
+    бинарников с одинаковым id.
+    """
+    w, h = _image_dimensions(data)
+    if w and h:
+        return w * h
+    return len(data) if data else 0
+
+def _sniff_image_size(data):
+    """Резервный парсер размеров без Pillow: PNG, GIF, JPEG, WebP, BMP."""
+    try:
+        if data[:8] == b'\x89PNG\r\n\x1a\n' and len(data) >= 24:
+            return struct.unpack('>II', data[16:24])
+
+        if data[:6] in (b'GIF87a', b'GIF89a') and len(data) >= 10:
+            return struct.unpack('<HH', data[6:10])
+
+        if data[:2] == b'\xff\xd8':
+            return _jpg_size(data)
+
+        if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+            return _webp_size(data)
+
+        if data[:2] == b'BM' and len(data) >= 26:
+            w = struct.unpack('<I', data[18:22])[0]
+            h = abs(struct.unpack('<i', data[22:26])[0])
+            return (w, h)
+    except Exception:
+        pass
+    return (None, None)
+
+def _jpg_size(data):
+    i = 2
+    n = len(data)
+    while i + 9 < n:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        if data[i + 1] == 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker == 0xDA:  # SOS — дальше закодированные данные
+            break
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            height = struct.unpack('>H', data[i + 5:i + 7])[0]
+            width = struct.unpack('>H', data[i + 7:i + 9])[0]
+            return (width, height)
+        seg_len = struct.unpack('>H', data[i + 2:i + 4])[0]
+        i += 2 + seg_len
+    return (None, None)
+
+def _webp_size(data):
+    if data[12:16] == b'VP8 ' and len(data) >= 30:
+        w = struct.unpack('<H', data[26:28])[0] & 0x3FFF
+        h = struct.unpack('<H', data[28:30])[0] & 0x3FFF
+        return (w, h)
+    if data[12:16] == b'VP8L' and len(data) >= 26 and data[21] == 0x2F:
+        bits = struct.unpack('<I', data[22:26])[0]
+        return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+    if data[12:16] == b'VP8X' and len(data) >= 30:
+        w = struct.unpack('<I', data[24:27] + b'\x00')[0] + 1
+        h = struct.unpack('<I', data[27:30] + b'\x00')[0] + 1
+        return (w, h)
+    return (None, None)
+
+def fb2_find(element, path):
+    """Поиск элемента с учётом пространства имён FB2."""
+    parts = path.split('/')
+    ns_path = '/'.join(f'{{{FB2_NS}}}{p}' if not p.startswith('{') else p for p in parts)
+    return element.find(ns_path)
+
+def fb2_findall(element, path):
+    """Поиск всех элементов с учётом пространства имён FB2."""
+    parts = path.split('/')
+    ns_path = '/'.join(f'{{{FB2_NS}}}{p}' if not p.startswith('{') else p for p in parts)
+    return element.findall(ns_path)
+
+def fb2_findtext(element, path, default=''):
+    """Получение текста элемента с учётом пространства имён FB2."""
+    el = fb2_find(element, path)
+    if el is not None:
+        return (el.text or '').strip()
+    return default
+
+def get_text_content(element):
+    """Рекурсивно извлекает весь текст из элемента."""
+    texts = []
+    if element.text:
+        texts.append(element.text)
+    for child in element:
+        texts.append(get_text_content(child))
+        if child.tail:
+            texts.append(child.tail)
+    return ''.join(texts)
+
+class FB2Book:
+    """Парсер FB2-файла."""
+    def __init__(self):
+        self.title = ''
+        self.authors = []
+        self.lang = 'ru'
+        self.book_id = ''
+        self.genres = []
+        self.annotation = None
+        self.date = ''
+        self.publisher = ''
+        self.year = ''
+        self.isbn = ''
+        self.series_name = ''
+        self.series_number = ''
+        self.coverpage_image_id = ''
+        self.sections = []
+        self.binaries = {}  # id -> (content_type, data_bytes)
+        self.epigraphs = []
+        self.body_element = None
+        self.extra_bodies = []  # notes и т.д.
+
+    def parse(self, filepath):
+        """Парсинг FB2-файла."""
+        if filepath.endswith('.zip'):
+            import zipfile as zf
+            with zf.ZipFile(filepath, 'r') as z:
+                for name in z.namelist():
+                    if name.lower().endswith('.fb2'):
+                        data = z.read(name)
+                        break
+                else:
+                    data = z.read(z.namelist()[0])
+            tree = ET.ElementTree(ET.fromstring(data))
+        else:
+            tree = ET.parse(filepath)
+        
+        root = tree.getroot()
+        self._parse_description(root)
+        self._parse_bodies(root)
+        self._parse_binaries(root)
+
+    def _parse_description(self, root):
+        """Парсинг метаданных книги."""
+        desc = fb2_find(root, 'description')
+        if desc is None:
+            return
+
+        # title-info
+        title_info = fb2_find(desc, 'title-info')
+        if title_info is not None:
+            self.title = fb2_findtext(title_info, 'book-title') or 'Untitled'
+            
+            # Авторы
+            for author_el in fb2_findall(title_info, 'author'):
+                first = fb2_findtext(author_el, 'first-name')
+                middle = fb2_findtext(author_el, 'middle-name')
+                last = fb2_findtext(author_el, 'last-name')
+                nickname = fb2_findtext(author_el, 'nickname')
+                parts = [p for p in [first, middle, last] if p]
+                name = ' '.join(parts) if parts else nickname or 'Unknown'
+                self.authors.append(name)
+            
+            if not self.authors:
+                self.authors = ['Unknown']
+            self.lang = fb2_findtext(title_info, 'lang') or 'ru'
+
+            # Жанры
+            for genre_el in fb2_findall(title_info, 'genre'):
+                if genre_el.text:
+                    self.genres.append(genre_el.text.strip())
+
+            # Аннотация
+            self.annotation = fb2_find(title_info, 'annotation')
+
+            # Дата
+            date_el = fb2_find(title_info, 'date')
+            if date_el is not None:
+                self.date = date_el.get('value', '') or (date_el.text or '').strip()
+
+            # Обложка
+            coverpage = fb2_find(title_info, 'coverpage')
+            if coverpage is not None:
+                image = fb2_find(coverpage, 'image')
+                if image is not None:
+                    href = image.get(f'{{{XLINK_NS}}}href', '')
+                    if href.startswith('#'):
+                        href = href[1:]
+                    self.coverpage_image_id = href
+
+            # Серия
+            sequence = fb2_find(title_info, 'sequence')
+            if sequence is not None:
+                self.series_name = sequence.get('name', '')
+                self.series_number = sequence.get('number', '')
+
+        # publish-info
+        publish_info = fb2_find(desc, 'publish-info')
+        if publish_info is not None:
+            self.publisher = fb2_findtext(publish_info, 'publisher')
+            self.year = fb2_findtext(publish_info, 'year')
+            self.isbn = fb2_findtext(publish_info, 'isbn')
+
+        # document-info — id
+        doc_info = fb2_find(desc, 'document-info')
+        if doc_info is not None:
+            self.book_id = fb2_findtext(doc_info, 'id')
+        if not self.book_id:
+            self.book_id = str(uuid.uuid4())
+
+    def _parse_bodies(self, root):
+        """Парсинг тел книги."""
+        bodies = fb2_findall(root, 'body')
+        for i, body in enumerate(bodies):
+            body_name = body.get('name', '')
+            if i == 0 and not body_name:
+                self.body_element = body
+                # Эпиграфы на уровне body
+                for epigraph in fb2_findall(body, 'epigraph'):
+                    self.epigraphs.append(epigraph)
+                # Секции
+                for section in fb2_findall(body, 'section'):
+                    self.sections.append(section)
+            else:
+                self.extra_bodies.append(body)
+
+    def _parse_binaries(self, root):
+        """Парсинг бинарных данных (изображения).
+
+        При дублирующемся id оставляем лучшую по качеству картинку,
+        чтобы плохая копия не перетирала хорошую.
+        """
+        for binary in fb2_findall(root, 'binary'):
+            binary_id = binary.get('id', '')
+            content_type = binary.get('content-type', 'application/octet-stream')
+            if not binary.text:
+                continue
+            data = base64.b64decode(binary.text.strip())
+            old = self.binaries.get(binary_id)
+            if old is not None and _image_quality(data) < _image_quality(old[1]):
+                continue
+            self.binaries[binary_id] = (content_type, data)
+
+class FB2ToXHTMLConverter:
+    """Конвертер элементов FB2 в XHTML."""
+    def __init__(self, book: FB2Book):
+        self.book = book
+        self.footnotes = {}  # id -> xhtml content
+        self.image_files = {}  # id -> filename
+        self.current_note_id = None
+        self._prepare_images()
+        self._parse_notes()
+
+    def _prepare_images(self):
+        """Подготовка имён файлов изображений."""
+        for binary_id, (content_type, data) in self.book.binaries.items():
+            ext = mimetypes.guess_extension(content_type) or '.bin'
+            if ext == '.jpe':
+                ext = '.jpg'
+            safe_name = re.sub(r'[^\w\-.]', '_', binary_id)
+            if not safe_name.lower().endswith(ext):
+                safe_name += ext
+            self.image_files[binary_id] = f'images/{safe_name}'
+
+    def _parse_notes(self):
+        """Парсинг примечаний из дополнительных body."""
+        for body in self.book.extra_bodies:
+            body_name = body.get('name', '')
+            for section in fb2_findall(body, 'section'):
+                section_id = section.get('id', '')
+                if section_id:
+                    self.footnotes[section_id] = section
+
+    def _get_image_filename(self, href):
+        """Получение имени файла изображения по ссылке."""
+        if href.startswith('#'):
+            href = href[1:]
+        return self.image_files.get(href, '')
+
+    def convert_section(self, section, level=1):
+        """Конвертация секции FB2 в XHTML-строку."""
+        lines = []
+        title_text = ''
+
+        # Обработка заголовка секции
+        title_el = fb2_find(section, 'title')
+        if title_el is not None:
+            title_text = self._convert_title(title_el, level)
+            lines.append(title_text)
+
+        # Эпиграф секции
+        for epigraph in fb2_findall(section, 'epigraph'):
+            lines.append(self._convert_epigraph(epigraph))
+
+        # Изображение секции
+        for image in fb2_findall(section, 'image'):
+            lines.append(self._convert_image(image))
+
+        # Аннотация секции
+        annotation = fb2_find(section, 'annotation')
+        if annotation is not None:
+            lines.append(self._convert_annotation(annotation))
+
+        # Содержимое секции
+        for child in section:
+            tag = self._local_tag(child)
+            if tag in ('title', 'epigraph', 'image', 'annotation'):
+                continue
+            elif tag == 'section':
+                lines.append(self.convert_section(child, level + 1))
+            elif tag == 'p':
+                lines.append(self._convert_p(child))
+            elif tag == 'poem':
+                lines.append(self._convert_poem(child))
+            elif tag == 'cite':
+                lines.append(self._convert_cite(child))
+            elif tag == 'subtitle':
+                lines.append(self._convert_subtitle(child))
+            elif tag == 'empty-line':
+                lines.append('<p class="empty-line">&#160;</p>')
+            elif tag == 'table':
+                lines.append(self._convert_table(child))
+            elif tag == 'code':
+                lines.append(f'<pre><code>{self._escape(get_text_content(child))}</code></pre>')
+            else:
+                # Попытка обработать как параграф
+                text = get_text_content(child)
+                if text.strip():
+                    lines.append(f'<p>{self._escape(text)}</p>')
+
+        return '\n'.join(lines)
+
+    def _convert_title(self, title_el, level=1):
+        """Конвертация заголовка."""
+        h_level = min(level, 6)
+        parts = []
+        for child in title_el:
+            tag = self._local_tag(child)
+            if tag == 'p':
+                parts.append(self._inline_content(child))
+            elif tag == 'empty-line':
+                parts.append('')
+        text = '<br/>'.join(parts) if parts else get_text_content(title_el).strip()
+        return f'<h{h_level}>{text}</h{h_level}>'
+
+    def _convert_subtitle(self, el):
+        """Конвертация подзаголовка."""
+        return f'<h4 class="subtitle">{self._inline_content(el)}</h4>'
+
+    def _convert_epigraph(self, epigraph):
+        """Конвертация эпиграфа."""
+        lines = ['<div class="epigraph">']
+        for child in epigraph:
+            tag = self._local_tag(child)
+            if tag == 'p':
+                lines.append(f'<p>{self._inline_content(child)}</p>')
+            elif tag == 'poem':
+                lines.append(self._convert_poem(child))
+            elif tag == 'cite':
+                lines.append(self._convert_cite(child))
+            elif tag == 'text-author':
+                lines.append(f'<p class="text-author">— {self._inline_content(child)}</p>')
+            elif tag == 'empty-line':
+                lines.append('<p class="empty-line">&#160;</p>')
+        lines.append('</div>')
+        return '\n'.join(lines)
+
+    def _convert_annotation(self, annotation):
+        """Конвертация аннотации."""
+        lines = ['<div class="annotation">']
+        for child in annotation:
+            tag = self._local_tag(child)
+            if tag == 'p':
+                lines.append(f'<p>{self._inline_content(child)}</p>')
+            elif tag == 'poem':
+                lines.append(self._convert_poem(child))
+            elif tag == 'cite':
+                lines.append(self._convert_cite(child))
+            elif tag == 'subtitle':
+                lines.append(self._convert_subtitle(child))
+            elif tag == 'empty-line':
+                lines.append('<p class="empty-line">&#160;</p>')
+        lines.append('</div>')
+        return '\n'.join(lines)
+
+    def _convert_p(self, p_el):
+        """Конвертация параграфа."""
+        p_id = p_el.get('id', '')
+        id_attr = f' id="{p_id}"' if p_id else ''
+        return f'<p{id_attr}>{self._inline_content(p_el)}</p>'
+
+    def _convert_poem(self, poem):
+        """Конвертация стихотворения."""
+        lines = ['<div class="poem">']
+        for child in poem:
+            tag = self._local_tag(child)
+            if tag == 'title':
+                lines.append(self._convert_title(child, 4))
+            elif tag == 'epigraph':
+                lines.append(self._convert_epigraph(child))
+            elif tag == 'stanza':
+                lines.append('<div class="stanza">')
+                for v in fb2_findall(child, 'v'):
+                    lines.append(f'<p class="verse">{self._inline_content(v)}</p>')
+                lines.append('</div>')
+            elif tag == 'text-author':
+                lines.append(f'<p class="text-author">— {self._inline_content(child)}</p>')
+            elif tag == 'date':
+                lines.append(f'<p class="date">{self._inline_content(child)}</p>')
+        lines.append('</div>')
+        return '\n'.join(lines)
+
+    def _convert_cite(self, cite):
+        """Конвертация цитаты."""
+        lines = ['<blockquote class="cite">']
+        for child in cite:
+            tag = self._local_tag(child)
+            if tag == 'p':
+                lines.append(f'<p>{self._inline_content(child)}</p>')
+            elif tag == 'poem':
+                lines.append(self._convert_poem(child))
+            elif tag == 'subtitle':
+                lines.append(self._convert_subtitle(child))
+            elif tag == 'text-author':
+                lines.append(f'<p class="text-author">— {self._inline_content(child)}</p>')
+            elif tag == 'empty-line':
+                lines.append('<p class="empty-line">&#160;</p>')
+        lines.append('</blockquote>')
+        return '\n'.join(lines)
+
+    def _convert_image(self, image):
+        """Конвертация изображения."""
+        href = image.get(f'{{{XLINK_NS}}}href', '')
+        img_file = self._get_image_filename(href)
+        if img_file:
+            alt = image.get('alt', '')
+            title = image.get('title', '')
+            title_attr = f' title="{self._escape(title)}"' if title else ''
+            return f'<div class="image"><img src="{img_file}" alt="{self._escape(alt)}"{title_attr}/></div>'
+        return ''
+
+    def _convert_table(self, table):
+        """Конвертация таблицы."""
+        lines = ['<table>']
+        for tr in fb2_findall(table, 'tr'):
+            lines.append('<tr>')
+            for child in tr:
+                tag = self._local_tag(child)
+                if tag == 'th':
+                    colspan = child.get('colspan', '')
+                    rowspan = child.get('rowspan', '')
+                    attrs = ''
+                    if colspan: attrs += f' colspan="{colspan}"'
+                    if rowspan: attrs += f' rowspan="{rowspan}"'
+                    lines.append(f'<th{attrs}>{self._inline_content(child)}</th>')
+                elif tag == 'td':
+                    colspan = child.get('colspan', '')
+                    rowspan = child.get('rowspan', '')
+                    attrs = ''
+                    if colspan: attrs += f' colspan="{colspan}"'
+                    if rowspan: attrs += f' rowspan="{rowspan}"'
+                    lines.append(f'<td{attrs}>{self._inline_content(child)}</td>')
+            lines.append('</tr>')
+        lines.append('</table>')
+        return '\n'.join(lines)
+
+    def _inline_content(self, element):
+        """Конвертация инлайн-содержимого элемента."""
+        result = []
+        if element.text:
+            result.append(self._escape(element.text))
+        for child in element:
+            tag = self._local_tag(child)
+            if tag == 'strong':
+                result.append(f'<strong>{self._inline_content(child)}</strong>')
+            elif tag == 'emphasis':
+                result.append(f'<em>{self._inline_content(child)}</em>')
+            elif tag == 'strikethrough':
+                result.append(f'<del>{self._inline_content(child)}</del>')
+            elif tag == 'sub':
+                result.append(f'<sub>{self._inline_content(child)}</sub>')
+            elif tag == 'sup':
+                result.append(f'<sup>{self._inline_content(child)}</sup>')
+            elif tag == 'code':
+                result.append(f'<code>{self._inline_content(child)}</code>')
+            elif tag == 'style':
+                result.append(f'<span>{self._inline_content(child)}</span>')
+            elif tag == 'a':
+                href = child.get(f'{{{XLINK_NS}}}href', '')
+                text = self._inline_content(child)
+                if href.startswith('#'):
+                    note_id = href[1:]
+                    if note_id in self.footnotes:
+                        result.append(
+                            f'<a epub:type="noteref" href="notes.xhtml#{note_id}"'
+                            f' class="note-ref">{text}</a>'
+                        )
+                    else:
+                        result.append(f'<a href="{href}">{text}</a>')
+                else:
+                    result.append(f'<a href="{href}">{text}</a>')
+            elif tag == 'image':
+                img_href = child.get(f'{{{XLINK_NS}}}href', '')
+                img_file = self._get_image_filename(img_href)
+                if img_file:
+                    result.append(f'<img src="{img_file}" alt="" class="inline-image"/>')
+                else:
+                    result.append(self._inline_content(child))
+            if child.tail:
+                result.append(self._escape(child.tail))
+        return ''.join(result)
+
+    def _local_tag(self, element):
+        """Получение локального имени тега без namespace."""
+        tag = element.tag
+        if '}' in tag:
+            return tag.split('}', 1)[1]
+        return tag
+
+    def _escape(self, text):
+        """HTML-экранирование текста."""
+        if not text:
+            return ''
+        text = text.replace('&', '&amp;')
+        text = text.replace('<', '&lt;')
+        text = text.replace('>', '&gt;')
+        text = text.replace('"', '&quot;')
+        return text
+
+class EPUBBuilder:
+    """Построитель EPUB 3 файла."""
+    STYLESHEET = """
+body {
+    font-family: serif;
+    margin: 1em;
+    line-height: 1.6;
+}
+h1, h2, h3, h4, h5, h6 {
+    text-align: center;
+    margin: 1.5em 0 0.5em 0;
+    font-weight: bold;
+}
+h1 { font-size: 1.8em; }
+h2 { font-size: 1.5em; }
+h3 { font-size: 1.3em; }
+h4 { font-size: 1.1em; }
+p {
+    text-indent: 1.5em;
+    margin: 0.2em 0;
+    text-align: justify;
+}
+p.empty-line {
+    text-indent: 0;
+    margin: 0.5em 0;
+}
+.subtitle {
+    text-align: center;
+    font-style: italic;
+}
+.epigraph {
+    margin: 1em 0 1em 30%;
+    font-style: italic;
+    font-size: 0.9em;
+}
+.epigraph p { text-indent: 0; }
+.annotation {
+    margin: 1em 2em;
+    font-style: italic;
+    border-left: 3px solid #ccc;
+    padding-left: 1em;
+}
+.annotation p { text-indent: 0; }
+.poem { margin: 1em 2em; }
+.stanza { margin: 0.5em 0; }
+.verse { text-indent: 0; text-align: left; }
+blockquote.cite {
+    margin: 1em 2em;
+    border-left: 3px solid #999;
+    padding-left: 1em;
+}
+blockquote.cite p { text-indent: 0; }
+.text-author {
+    text-indent: 0;
+    text-align: right;
+    font-style: italic;
+    margin-top: 0.5em;
+}
+.image {
+    text-align: center;
+    margin: 1em 0;
+}
+.image img {
+    max-width: 100%;
+    max-height: 90vh;
+}
+.inline-image {
+    vertical-align: middle;
+    max-height: 1.5em;
+}
+.title-page {
+    text-align: center;
+    margin-top: 20%;
+}
+.title-page h1 {
+    font-size: 2em;
+    margin-bottom: 0.5em;
+}
+.title-page .author {
+    font-size: 1.3em;
+    margin-bottom: 1em;
+}
+.title-page .series {
+    font-style: italic;
+    margin-top: 1em;
+}
+a.note-ref {
+    font-size: 0.8em;
+    vertical-align: super;
+    text-decoration: none;
+    color: #0066cc;
+}
+.footnote {
+    margin: 1em 0;
+    padding: 0.5em 0;
+    border-top: 1px solid #eee;
+    font-size: 0.9em;
+}
+.footnote-title {
+    font-weight: bold;
+    margin-bottom: 0.3em;
+}
+table {
+    border-collapse: collapse;
+    margin: 1em auto;
+}
+td, th {
+    border: 1px solid #999;
+    padding: 0.3em 0.5em;
+}
+th {
+    background-color: #f0f0f0;
+    font-weight: bold;
+}
+.date {
+    text-indent: 0;
+    text-align: right;
+    font-style: italic;
+}
+"""
+
+    def __init__(self, book: FB2Book):
+        self.book = book
+        self.converter = FB2ToXHTMLConverter(book)
+        self.chapters = []  # (filename, title, content)
+        self.spine_items = []  # (id, filename)
+        self.manifest_items = []  # (id, filename, media_type, properties)
+        self.frontmatter_content = ""
+
+    def build(self, output_path):
+        """Построение EPUB-файла."""
+        self._prepare_chapters()
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as epub:
+            # mimetype (без сжатия, первый файл!)
+            epub.writestr('mimetype', 'application/epub+zip', compress_type=zipfile.ZIP_STORED)
+            # META-INF/container.xml
+            epub.writestr('META-INF/container.xml', self._build_container())
+            # Стили
+            epub.writestr('OEBPS/style.css', self.STYLESHEET)
+            self.manifest_items.append(('style', 'style.css', 'text/css', ''))
+            # Изображения
+            self._write_images(epub)
+            # Титульная страница
+            self._build_title_page(epub)
+            # Обложка (если есть)
+            self._build_cover_page(epub)
+            
+            # Frontmatter (вступительные части без заголовков)
+            if getattr(self, 'frontmatter_content', ''):
+                xhtml = self._wrap_xhtml('', self.frontmatter_content, body_style="margin: 1em;")
+                epub.writestr('OEBPS/frontmatter.xhtml', xhtml)
+
+            # Главы
+            for filename, title, content in self.chapters:
+                xhtml = self._wrap_xhtml(title, content)
+                epub.writestr(f'OEBPS/{filename}', xhtml)
+                
+            # Примечания
+            if self.converter.footnotes:
+                self._build_notes_page(epub)
+                
+            # Оглавление (nav)
+            nav_content = self._build_nav()
+            epub.writestr('OEBPS/nav.xhtml', nav_content)
+            self.manifest_items.append(('nav', 'nav.xhtml', 'application/xhtml+xml', 'nav'))
+            self.spine_items.append(('nav', 'nav.xhtml'))
+            
+            # OPF
+            epub.writestr('OEBPS/content.opf', self._build_opf())
+        print(f'EPUB создан: {output_path}')
+
+    def _prepare_chapters(self):
+        """Подготовка глав из секций FB2."""
+        self.frontmatter_content = ""
+        if not self.book.sections:
+            if self.book.body_element is not None:
+                content = self.converter.convert_section(self.book.body_element, 1)
+                filename = 'chapter_001.xhtml'
+                self.chapters.append((filename, self.book.title, content))
+                self.manifest_items.append(('chapter_001', filename, 'application/xhtml+xml', ''))
+                self.spine_items.append(('chapter_001', filename))
+            return
+
+        frontmatter_parts = []
+        chapter_idx = 1
+        found_first_title = False
+
+        for section in self.book.sections:
+            title_el = fb2_find(section, 'title')
+            if title_el is None and not found_first_title:
+                # Секция без заголовка в самом начале книги (титул, копирайт, аннотация)
+                frontmatter_parts.append(self.converter.convert_section(section, 1))
+            else:
+                found_first_title = True
+                if title_el is not None:
+                    title = get_text_content(title_el).strip()
+                    title = ' '.join(title.split())
+                else:
+                    title = f'Глава {chapter_idx}'
+                    
+                content = self.converter.convert_section(section, 1)
+                filename = f'chapter_{chapter_idx:03d}.xhtml'
+                self.chapters.append((filename, title, content))
+                self.manifest_items.append((f'chapter_{chapter_idx:03d}', filename, 'application/xhtml+xml', ''))
+                self.spine_items.append((f'chapter_{chapter_idx:03d}', filename))
+                chapter_idx += 1
+
+        if not self.chapters and frontmatter_parts:
+            # Если вообще нет заголовков, делаем всё одной главой
+            filename = 'chapter_001.xhtml'
+            self.chapters.append((filename, self.book.title, '\n'.join(frontmatter_parts)))
+            self.manifest_items.append(('chapter_001', filename, 'application/xhtml+xml', ''))
+            self.spine_items.append(('chapter_001', filename))
+        elif frontmatter_parts:
+            self.frontmatter_content = '\n'.join(frontmatter_parts)
+            self.manifest_items.insert(0, ('frontmatter', 'frontmatter.xhtml', 'application/xhtml+xml', ''))
+            self.spine_items.insert(0, ('frontmatter', 'frontmatter.xhtml'))
+
+    def _write_images(self, epub):
+        """Запись изображений в EPUB."""
+        for binary_id, (content_type, data) in self.book.binaries.items():
+            filename = self.converter.image_files.get(binary_id, '')
+            if filename:
+                epub.writestr(f'OEBPS/{filename}', data)
+                item_id = re.sub(r'[^\w]', '_', binary_id)
+                properties = ''
+                if binary_id == self.book.coverpage_image_id:
+                    properties = 'cover-image'
+                self.manifest_items.append(
+                    (f'img_{item_id}', filename, content_type, properties)
+                )
+
+    def _build_cover_page(self, epub):
+        """Построение страницы с обложкой."""
+        if not self.book.coverpage_image_id:
+            return
+        img_file = self.converter.image_files.get(self.book.coverpage_image_id, '')
+        if not img_file:
+            return
+
+        # Размеры берём из бинарника, чтобы SVG сохранил пропорции картинки.
+        binary = self.book.binaries.get(self.book.coverpage_image_id)
+        width, height = _image_dimensions(binary[1]) if binary else (None, None)
+        if not width or not height:
+            width, height = (600, 900)  # резервная книжная пропорция
+
+        # Обложка вписывается в страницу целиком без искажения через SVG.
+        # SVG знает собственные пропорции (viewBox), поэтому ридер никогда
+        # не растянет картинку по горизонтали при малой высоте.
+        content = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" '
+            f'width="100%" height="100%" viewBox="0 0 {width} {height}" '
+            f'preserveAspectRatio="xMidYMid meet">'
+            f'<image width="{width}" height="{height}" xlink:href="{img_file}"/>'
+            f'</svg>'
+        )
+
+        xhtml = self._wrap_xhtml('Cover', content, body_style="margin: 0; padding: 0;")
+        epub.writestr('OEBPS/cover.xhtml', xhtml)
+        self.manifest_items.insert(0, ('cover', 'cover.xhtml', 'application/xhtml+xml', ''))
+        self.spine_items.insert(0, ('cover', 'cover.xhtml'))
+
+    def _build_title_page(self, epub):
+        """Построение титульной страницы."""
+        lines = ['<div class="title-page">']
+        for author in self.book.authors:
+            lines.append(f'<p class="author">{self.converter._escape(author)}</p>')
+        lines.append(f'<h1>{self.converter._escape(self.book.title)}</h1>')
+        if self.book.series_name:
+            series_text = self.book.series_name
+            if self.book.series_number:
+                series_text += f' #{self.book.series_number}'
+            lines.append(f'<p class="series">{self.converter._escape(series_text)}</p>')
+        if self.book.annotation is not None:
+            lines.append('<div class="annotation">')
+            for child in self.book.annotation:
+                tag = self.converter._local_tag(child)
+                if tag == 'p':
+                    lines.append(f'<p>{self.converter._inline_content(child)}</p>')
+                elif tag == 'empty-line':
+                    lines.append('<p class="empty-line">&#160;</p>')
+            lines.append('</div>')
+        lines.append('</div>')
+        content = '\n'.join(lines)
+        xhtml = self._wrap_xhtml('Title', content)
+        epub.writestr('OEBPS/title.xhtml', xhtml)
+        self.manifest_items.insert(0, ('title_page', 'title.xhtml', 'application/xhtml+xml', ''))
+        self.spine_items.insert(0, ('title_page', 'title.xhtml'))
+
+    def _build_notes_page(self, epub):
+        """Построение страницы примечаний."""
+        lines = ['<section epub:type="endnotes">', '<h1>Примечания</h1>']
+        for note_id, section in self.converter.footnotes.items():
+            lines.append(f'<aside epub:type="footnote" id="{note_id}" class="footnote">')
+            for child in section:
+                tag = self.converter._local_tag(child)
+                if tag == 'title':
+                    title_text = get_text_content(child).strip()
+                    lines.append(f'<p class="footnote-title">{self.converter._escape(title_text)}</p>')
+                elif tag == 'p':
+                    lines.append(f'<p>{self.converter._inline_content(child)}</p>')
+                elif tag == 'empty-line':
+                    lines.append('<p class="empty-line">&#160;</p>')
+            lines.append('</aside>')
+        lines.append('</section>')
+        content = '\n'.join(lines)
+        xhtml = self._wrap_xhtml('Примечания', content)
+        epub.writestr('OEBPS/notes.xhtml', xhtml)
+        self.manifest_items.append(('notes', 'notes.xhtml', 'application/xhtml+xml', ''))
+        self.spine_items.append(('notes', 'notes.xhtml'))
+
+    def _build_container(self):
+        """Построение container.xml."""
+        return '''<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+<rootfiles>
+<rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+</rootfiles>
+</container>'''
+
+    def _build_opf(self):
+        """Построение content.opf."""
+        # Исправлено: используем timezone-aware datetime
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="BookId">',
+            '',
+            '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">',
+            f'    <dc:identifier id="BookId">urn:uuid:{self.book.book_id}</dc:identifier>',
+            f'    <dc:title>{self._escape_xml(self.book.title)}</dc:title>',
+            f'    <dc:language>{self.book.lang}</dc:language>',
+        ]
+        for author in self.book.authors:
+            lines.append(f'    <dc:creator>{self._escape_xml(author)}</dc:creator>')
+        if self.book.date:
+            lines.append(f'    <dc:date>{self._escape_xml(self.book.date)}</dc:date>')
+        if self.book.publisher:
+            lines.append(f'    <dc:publisher>{self._escape_xml(self.book.publisher)}</dc:publisher>')
+        if self.book.isbn:
+            lines.append(f'    <dc:identifier>isbn:{self._escape_xml(self.book.isbn)}</dc:identifier>')
+        for genre in self.book.genres:
+            lines.append(f'    <dc:subject>{self._escape_xml(genre)}</dc:subject>')
+        lines.append(f'    <meta property="dcterms:modified">{now}</meta>')
+        if self.book.series_name:
+            lines.append(f'    <meta property="belongs-to-collection">{self._escape_xml(self.book.series_name)}</meta>')
+            lines.append(f'    <meta property="collection-type">series</meta>')
+        if self.book.series_number:
+            lines.append(f'    <meta property="group-position">{self.book.series_number}</meta>')
+        lines.append('  </metadata>')
+        lines.append('')
+        
+        # Manifest
+        lines.append('  <manifest>')
+        for item_id, filename, media_type, properties in self.manifest_items:
+            props_attr = f' properties="{properties}"' if properties else ''
+            lines.append(f'    <item id="{item_id}" href="{filename}" media-type="{media_type}"{props_attr}/>')
+        lines.append('  </manifest>')
+        lines.append('')
+        
+        # Spine
+        lines.append('  <spine>')
+        for item_id, filename in self.spine_items:
+            lines.append(f'    <itemref idref="{item_id}"/>')
+        lines.append('  </spine>')
+        lines.append('')
+        lines.append('</package>')
+        return '\n'.join(lines)
+
+    def _build_nav(self):
+        """Построение навигационного документа (nav.xhtml)."""
+        lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<!DOCTYPE html>',
+            '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">',
+            '<head>',
+            '  <meta charset="UTF-8"/>',
+            '  <title>Содержание</title>',
+            '  <link rel="stylesheet" type="text/css" href="style.css"/>',
+            '</head>',
+            '<body>',
+            '  <nav epub:type="toc" id="toc">',
+            '    <h1>Содержание</h1>',
+            '    <ol>',
+        ]
+        for filename, title, _ in self.chapters:
+            safe_title = self._escape_xml(title)
+            lines.append(f'      <li><a href="{filename}">{safe_title}</a></li>')
+        if self.converter.footnotes:
+            lines.append(f'      <li><a href="notes.xhtml">Примечания</a></li>')
+        lines.extend([
+            '    </ol>',
+            '  </nav>',
+            '</body>',
+            '</html>',
+        ])
+        return '\n'.join(lines)
+
+    def _wrap_xhtml(self, title, content, body_style=""):
+        """Обёртка контента в полный XHTML-документ."""
+        style_attr = f' style="{body_style}"' if body_style else ''
+        return f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="{self.book.lang}">
+<head>
+<meta charset="UTF-8"/>
+<title>{self._escape_xml(title)}</title>
+<link rel="stylesheet" type="text/css" href="style.css"/>
+</head>
+<body{style_attr}>
+{content}
+</body>
+</html>'''
+
+    def _escape_xml(self, text):
+        """XML-экранирование."""
+        if not text:
+            return ''
+        text = text.replace('&', '&amp;')
+        text = text.replace('<', '&lt;')
+        text = text.replace('>', '&gt;')
+        text = text.replace('"', '&quot;')
+        text = text.replace("'", '&apos;')
+        return text
+
+def convert_fb2_to_epub(input_path, output_path=None):
+    """
+    Конвертирует FB2-файл в EPUB 3.
+    """
+    input_path = str(input_path)
+    if output_path is None:
+        base = os.path.splitext(input_path)[0]
+        if base.endswith('.fb2'):
+            base = base[:-4]
+        output_path = base + '.epub'
+        
+    print(f'Чтение: {input_path}')
+    book = FB2Book()
+    book.parse(input_path)
+    print(f'Название: {book.title}')
+    print(f'Автор(ы): {", ".join(book.authors)}')
+    print(f'Язык: {book.lang}')
+    print(f'Секций: {len(book.sections)}')
+    print(f'Изображений: {len(book.binaries)}')
+    
+    builder = EPUBBuilder(book)
+    builder.build(output_path)
+    return output_path
+
+def main():
+    """Точка входа CLI."""
+    if len(sys.argv) < 2:
+        print('Использование: python fb2epub.py <input.fb2> [output.epub]')
+        sys.exit(1)
+
+    input_path = sys.argv[1]
+    output_path = sys.argv[2] if len(sys.argv) > 2 else None
+
+    if not os.path.exists(input_path):
+        print(f'Ошибка: файл не найден: {input_path}')
+        sys.exit(1)
+
+    try:
+        result = convert_fb2_to_epub(input_path, output_path)
+        print(f'Готово!')
+    except Exception as e:
+        print(f'Ошибка конвертации: {e}')
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
