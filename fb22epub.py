@@ -335,8 +335,13 @@ class FB2ToXHTMLConverter:
             href = href[1:]
         return self.image_files.get(href, '')
 
-    def convert_section(self, section, level=1):
-        """Конвертация секции FB2 в XHTML-строку."""
+    def convert_section(self, section, level=1, split=None):
+        """Конвертация секции FB2 в XHTML-строку.
+
+        split — необязательный колбэк (el, level) -> bool. Если он возвращает
+        True для вложенной секции, она не попадает в этот файл: вызывающий
+        код берёт её на себя (отдельный файл главы).
+        """
         lines = []
         title_text = ''
 
@@ -365,6 +370,8 @@ class FB2ToXHTMLConverter:
             if tag in ('title', 'epigraph', 'image', 'annotation'):
                 continue
             elif tag == 'section':
+                if split is not None and split(child, level + 1):
+                    continue
                 lines.append(self.convert_section(child, level + 1))
             elif tag == 'p':
                 lines.append(self._convert_p(child))
@@ -388,7 +395,7 @@ class FB2ToXHTMLConverter:
 
         return '\n'.join(lines)
 
-    def _convert_title(self, title_el, level=1):
+    def _convert_title(self, title_el, level=1, anchor=''):
         """Конвертация заголовка."""
         h_level = min(level, 6)
         parts = []
@@ -399,7 +406,8 @@ class FB2ToXHTMLConverter:
             elif tag == 'empty-line':
                 parts.append('')
         text = '<br/>'.join(parts) if parts else get_text_content(title_el).strip()
-        return f'<h{h_level}>{text}</h{h_level}>'
+        id_attr = f' id="{anchor}"' if anchor else ''
+        return f'<h{h_level}{id_attr}>{text}</h{h_level}>'
 
     def _convert_subtitle(self, el):
         """Конвертация подзаголовка."""
@@ -706,13 +714,18 @@ th {
 }
 """
 
+    MAX_SPLIT_LEVEL = 2  # до какого уровня вложенности секция получает свой файл
+
     def __init__(self, book: FB2Book):
         self.book = book
         self.converter = FB2ToXHTMLConverter(book)
-        self.chapters = []  # (filename, title, content)
+        # Словари: file, title, content, toc [(label, href), ...]
+        self.chapters = []
         self.spine_items = []  # (id, filename)
         self.manifest_items = []  # (id, filename, media_type, properties)
         self.frontmatter_content = ""
+        self.chapter_idx = 1
+        self.part_idx = 1
 
     def build(self, output_path):
         """Построение EPUB-файла."""
@@ -738,9 +751,9 @@ th {
                 epub.writestr('OEBPS/frontmatter.xhtml', xhtml)
 
             # Главы
-            for filename, title, content in self.chapters:
-                xhtml = self._wrap_xhtml(title, content)
-                epub.writestr(f'OEBPS/{filename}', xhtml)
+            for chapter in self.chapters:
+                xhtml = self._wrap_xhtml(chapter['title'], chapter['content'])
+                epub.writestr(f'OEBPS/{chapter["file"]}', xhtml)
                 
             # Примечания
             if self.converter.footnotes:
@@ -754,7 +767,89 @@ th {
             
             # OPF
             epub.writestr('OEBPS/content.opf', self._build_opf())
-        print(f'EPUB создан: {output_path}')
+        toc_items = sum(len(c['toc']) for c in self.chapters)
+        print(f'EPUB создан: {output_path} '
+              f'(файлов глав: {len(self.chapters)}, пунктов оглавления: {toc_items})')
+
+    def _section_title(self, section):
+        """Нормализованный текст заголовка секции ('' если заголовка нет)."""
+        title_el = fb2_find(section, 'title')
+        if title_el is None:
+            return ''
+        return ' '.join(get_text_content(title_el).split())
+
+    def _section_has_own_content(self, section):
+        """Есть ли у секции собственный текст (помимо заголовка и вложенных секций)."""
+        for child in section:
+            tag = self.converter._local_tag(child)
+            if tag in ('section', 'title', 'empty-line'):
+                continue
+            if tag == 'image' or get_text_content(child).strip():
+                return True
+        return False
+
+    def _can_split(self, section, level):
+        """Можно ли вынести секцию в отдельный файл главы."""
+        if level > self.MAX_SPLIT_LEVEL or level < 2:
+            return False
+        title = self._section_title(section)
+        if not title:
+            return False
+        # Заголовки вида «1», «2» (письма, тома) — не оглавление, а шум
+        if re.fullmatch(r'[\W\d_]+', title):
+            return False
+        return self._section_has_own_content(section)
+
+    def _add_chapter(self, title, content, toc):
+        """Регистрация файла главы в chapters/manifest/spine."""
+        stem = f'chapter_{self.chapter_idx:03d}'
+        self.chapter_idx += 1
+        self.chapters.append({
+            'file': f'{stem}.xhtml',
+            'title': title,
+            'content': content,
+            'toc': toc,
+        })
+        self.manifest_items.append((stem, f'{stem}.xhtml', 'application/xhtml+xml', ''))
+        self.spine_items.append((stem, f'{stem}.xhtml'))
+
+    def _add_section_files(self, section, level):
+        """Файлы для секции и всех вложенных секций, которые уходят в отдельные файлы."""
+        kids = [c for c in section if self.converter._local_tag(c) == 'section']
+        splittable = [c for c in kids if self._can_split(c, level + 1)]
+        title = self._section_title(section)
+
+        # «Часть» без своего текста (только заголовок + главы) не заслуживает
+        # отдельного файла: её заголовок печатается в начале первой главы.
+        folded = bool(splittable) and len(splittable) == len(kids) and title \
+            and not self._section_has_own_content(section)
+
+        if folded:
+            first_idx = len(self.chapters)
+            for kid in splittable:
+                self._add_section_files(kid, level + 1)
+            anchor = f'part-{self.part_idx}'
+            self.part_idx += 1
+            first = self.chapters[first_idx]
+            heading = self.converter._convert_title(fb2_find(section, 'title'), level, anchor)
+            first['content'] = heading + '\n' + first['content']
+            first['toc'].insert(0, (title, f"{first['file']}#{anchor}"))
+            return
+
+        pending = []
+
+        def split(el, _level):
+            if self._can_split(el, _level):
+                pending.append(el)
+                return True
+            return False
+
+        content = self.converter.convert_section(section, level, split)
+        if not title:
+            title = f'Глава {self.chapter_idx}'
+        self._add_chapter(title, content, [(title, None)])
+        for kid in pending:
+            self._add_section_files(kid, level + 1)
 
     def _prepare_chapters(self):
         """Подготовка глав из секций FB2."""
@@ -762,42 +857,25 @@ th {
         if not self.book.sections:
             if self.book.body_element is not None:
                 content = self.converter.convert_section(self.book.body_element, 1)
-                filename = 'chapter_001.xhtml'
-                self.chapters.append((filename, self.book.title, content))
-                self.manifest_items.append(('chapter_001', filename, 'application/xhtml+xml', ''))
-                self.spine_items.append(('chapter_001', filename))
+                self._add_chapter(self.book.title, content,
+                                  [(self.book.title, None)])
             return
 
         frontmatter_parts = []
-        chapter_idx = 1
         found_first_title = False
 
         for section in self.book.sections:
-            title_el = fb2_find(section, 'title')
-            if title_el is None and not found_first_title:
+            if fb2_find(section, 'title') is None and not found_first_title:
                 # Секция без заголовка в самом начале книги (титул, копирайт, аннотация)
                 frontmatter_parts.append(self.converter.convert_section(section, 1))
             else:
                 found_first_title = True
-                if title_el is not None:
-                    title = get_text_content(title_el).strip()
-                    title = ' '.join(title.split())
-                else:
-                    title = f'Глава {chapter_idx}'
-                    
-                content = self.converter.convert_section(section, 1)
-                filename = f'chapter_{chapter_idx:03d}.xhtml'
-                self.chapters.append((filename, title, content))
-                self.manifest_items.append((f'chapter_{chapter_idx:03d}', filename, 'application/xhtml+xml', ''))
-                self.spine_items.append((f'chapter_{chapter_idx:03d}', filename))
-                chapter_idx += 1
+                self._add_section_files(section, 1)
 
         if not self.chapters and frontmatter_parts:
             # Если вообще нет заголовков, делаем всё одной главой
-            filename = 'chapter_001.xhtml'
-            self.chapters.append((filename, self.book.title, '\n'.join(frontmatter_parts)))
-            self.manifest_items.append(('chapter_001', filename, 'application/xhtml+xml', ''))
-            self.spine_items.append(('chapter_001', filename))
+            self._add_chapter(self.book.title, '\n'.join(frontmatter_parts),
+                              [(self.book.title, None)])
         elif frontmatter_parts:
             self.frontmatter_content = '\n'.join(frontmatter_parts)
             self.manifest_items.insert(0, ('frontmatter', 'frontmatter.xhtml', 'application/xhtml+xml', ''))
@@ -971,9 +1049,11 @@ th {
             '    <h1>Содержание</h1>',
             '    <ol>',
         ]
-        for filename, title, _ in self.chapters:
-            safe_title = self._escape_xml(title)
-            lines.append(f'      <li><a href="{filename}">{safe_title}</a></li>')
+        for chapter in self.chapters:
+            for label, href in chapter['toc']:
+                safe_label = self._escape_xml(label)
+                target = href if href else chapter['file']
+                lines.append(f'      <li><a href="{target}">{safe_label}</a></li>')
         if self.converter.footnotes:
             lines.append(f'      <li><a href="notes.xhtml">Примечания</a></li>')
         lines.extend([
