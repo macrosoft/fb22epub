@@ -15,7 +15,7 @@ Convert FictionBook (FB2) e-books to EPUB 3 format with a single Python script.
 - **Images**: embedded and binary-linked images are extracted to `images/`; when duplicate ids exist, the highest-quality copy wins.
 - **Image dimension sniffing** without Pillow: built-in parsers for PNG, GIF, JPEG, WebP, and BMP.
 - **Structure**: chapters, sub-chapters, epigraphs, annotations, poems, quotes, tables, code blocks, subtitles, and notes (footnotes) are converted to styled XHTML.
-- **Chapter splitting**: every titled section up to the second nesting level becomes its own XHTML file; deeper sections stay inline as `h3`–`h6`. Sections whose title is just a number (e.g. the letters `1`, `2`) are never split out.
+- **Chapter splitting**: every titled section up to the second nesting level becomes its own XHTML file; deeper sections stay inline as `h3`–`h6`. Sections whose title is just a number (e.g. the letters `1`, `2`) are never split out. Heading-only parts ("Part One", "Book Two") are transparent — they don't count toward the nesting depth, so chapters nested inside them (roman → part → chapter) still get their own files.
 - **Flat TOC**: `nav.xhtml` lists every chapter file in document order. A part that has no text of its own (only a heading plus chapters) does not get a file — its heading is printed at the top of its first chapter and linked from the TOC via an anchor.
 - **Footnote support**: `notes.xhtml` endnotes page with `epub:type` markup and `noteref` links.
 - **Frontmatter**: sections without a title at the beginning of the book (title page, copyright, annotation) are placed in frontmatter.

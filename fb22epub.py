@@ -846,13 +846,18 @@ th {
                 return self._smart_trim_inferred_title(text)
         return ''
 
+    def _title_text(self, section):
+        """Текст title-элемента секции ('' если собственного заголовка нет)."""
+        title_el = fb2_find(section, 'title')
+        if title_el is None:
+            return ''
+        return ' '.join(get_text_content(title_el).split())
+
     def _section_title(self, section):
         """Нормализованный текст заголовка секции ('' если заголовка нет)."""
-        title_el = fb2_find(section, 'title')
-        if title_el is not None:
-            t = ' '.join(get_text_content(title_el).split())
-            if t:
-                return t
+        t = self._title_text(section)
+        if t:
+            return t
         t = self._infer_section_title(section)
         if not t:
             return '***'
@@ -880,6 +885,65 @@ th {
             return False
         return self._section_has_own_content(section)
 
+    def _is_transparent_part(self, section, level):
+        """Является ли секция «частью» без собственного текста (том, книга).
+
+        Такая секция — только заголовок и вложенные секции, при этом все
+        вложенные секции уходят в отдельные файлы. Своего файла часть не
+        получает (см. _fold_part_files), и уровень вложенности для её глав
+        не увеличивается: главы части считаются главами родительской секции.
+        Иначе книги вида «роман -> часть -> глава» целиком сливались бы
+        в один файл, не проходя по MAX_SPLIT_LEVEL.
+        """
+        if level + 1 > self.MAX_SPLIT_LEVEL:
+            return False
+        title = self._title_text(section)
+        if not title or re.fullmatch(r'[\W\d_]+', title):
+            return False
+        if self._section_has_own_content(section):
+            return False
+        kids = [c for c in section if self.converter._local_tag(c) == 'section']
+        if not kids:
+            return False
+        for kid in kids:
+            if not (self._can_split(kid, level + 1)
+                    or self._is_transparent_part(kid, level)):
+                return False
+        return True
+
+    def _fold_part_files(self, section, level):
+        """Файлы для «части» без своего файла.
+
+        Заголовок части печатается в начале первой созданной главы и
+        связывается из оглавления якорем. Вложенные прозрачные части
+        сворачиваются рекурсивно на том же уровне.
+        """
+        first_idx = len(self.chapters)
+        for child in section:
+            if self.converter._local_tag(child) != 'section':
+                continue
+            if self._can_split(child, level + 1):
+                self._add_section_files(child, level + 1)
+            elif self._is_transparent_part(child, level):
+                self._fold_part_files(child, level)
+        if len(self.chapters) == first_idx:
+            # Страховка: ничего не вынеслось — выводим секцию целиком главой.
+            title = self._section_title(section)
+            self._add_chapter(title,
+                              self.converter.convert_section(section, level),
+                              [(title, None)])
+            return
+        title = self._title_text(section)
+        if not title:
+            return
+        anchor = f'part-{self.part_idx}'
+        self.part_idx += 1
+        first = self.chapters[first_idx]
+        heading = self.converter._convert_title(fb2_find(section, 'title'),
+                                                level, anchor)
+        first['content'] = heading + '\n' + first['content']
+        first['toc'].insert(0, (title, f"{first['file']}#{anchor}"))
+
     def _add_chapter(self, title, content, toc):
         """Регистрация файла главы в chapters/manifest/spine."""
         stem = f'chapter_{self.chapter_idx:03d}'
@@ -897,30 +961,25 @@ th {
         """Файлы для секции и всех вложенных секций, которые уходят в отдельные файлы."""
         kids = [c for c in section if self.converter._local_tag(c) == 'section']
         splittable = [c for c in kids if self._can_split(c, level + 1)]
+        parts = [c for c in kids if c not in splittable
+                 and self._is_transparent_part(c, level)]
         title = self._section_title(section)
 
         # «Часть» без своего текста (только заголовок + главы) не заслуживает
         # отдельного файла: её заголовок печатается в начале первой главы.
-        folded = bool(splittable) and len(splittable) == len(kids) and title \
-            and not self._section_has_own_content(section)
-
-        if folded:
-            first_idx = len(self.chapters)
-            for kid in splittable:
-                self._add_section_files(kid, level + 1)
-            anchor = f'part-{self.part_idx}'
-            self.part_idx += 1
-            first = self.chapters[first_idx]
-            heading = self.converter._convert_title(fb2_find(section, 'title'), level, anchor)
-            first['content'] = heading + '\n' + first['content']
-            first['toc'].insert(0, (title, f"{first['file']}#{anchor}"))
+        if (splittable or parts) and len(splittable) + len(parts) == len(kids) \
+                and not self._section_has_own_content(section):
+            self._fold_part_files(section, level)
             return
 
         pending = []
 
         def split(el, _level):
             if self._can_split(el, _level):
-                pending.append(el)
+                pending.append((el, False))
+                return True
+            if self._is_transparent_part(el, level):
+                pending.append((el, True))
                 return True
             return False
 
@@ -928,8 +987,11 @@ th {
         if not title:
             title = '***'
         self._add_chapter(title, content, [(title, None)])
-        for kid in pending:
-            self._add_section_files(kid, level + 1)
+        for kid, is_part in pending:
+            if is_part:
+                self._fold_part_files(kid, level)
+            else:
+                self._add_section_files(kid, level + 1)
 
     def _prepare_chapters(self):
         """Подготовка глав из секций FB2."""
