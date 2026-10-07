@@ -771,12 +771,92 @@ th {
         print(f'EPUB создан: {output_path} '
               f'(файлов глав: {len(self.chapters)}, пунктов оглавления: {toc_items})')
 
+    def _smart_trim_inferred_title(self, s, max_chars=60, max_words=12):
+        """Красиво обрезать предполагаемый заголовок."""
+        if not s:
+            return ''
+        # Нормализуем пробелы
+        s = re.sub(r'[\r\n\t]+', ' ', s)
+        s = re.sub(r'\s+', ' ', s).strip()
+        if not s:
+            return ''
+        # Пытаемся взять первое предложение по . ! ?
+        m = re.match(r'(.+?[.!?])(?:\s|$)', s)
+        cand = m.group(1).strip() if m else s
+        # Если первое предложение слишком короткое (< 10 символов) или
+        # не заканчивается знаком — можно взять чуть больше, но не навязчиво
+        # Обрезаем по символам, не рвём слова
+        if len(cand) > max_chars:
+            # режем по словам
+            words = cand.split()
+            res = []
+            total = 0
+            for w in words:
+                if total + len(w) + (1 if res else 0) > max_chars:
+                    break
+                res.append(w)
+                total += len(w) + 1
+            cand2 = ' '.join(res).rstrip('.,:;!?')
+            cand = cand2 if cand2 else cand[:max_chars].rstrip()
+        # Если после всех манипуляций пусто — возвращаем обрезанный по словам оригинал
+        if not cand:
+            words = s.split()
+            res = []
+            total = 0
+            for w in words:
+                if total + len(w) + 1 > max_chars and res:
+                    break
+                res.append(w)
+                total += len(w) + 1
+            cand = ' '.join(res)
+        return cand.strip()
+
+    def _infer_section_title(self, section):
+        """Инферировать заголовок из первого отображаемого текста секции."""
+        # Ищем первый отображаемый текстовый элемент в документном порядке
+        for child in section:
+            tag = self.converter._local_tag(child)
+            if tag in ('title', 'section'):
+                continue
+            if tag in ('empty-line',):
+                continue
+            if tag == 'image':
+                # Изображение не даёт текстового заголовка
+                continue
+            # Подходящие текстовые блоки
+            if tag in ('epigraph', 'p', 'subtitle', 'cite', 'annotation', 'text-author'):
+                text = get_text_content(child)
+                text = text.strip()
+                if text:
+                    return self._smart_trim_inferred_title(text)
+            # poem — берём первую строку/первый абзац
+            if tag == 'poem':
+                # poem может содержать stanza/v или p
+                text = get_text_content(child)
+                text = text.strip()
+                if text:
+                    return self._smart_trim_inferred_title(text)
+            # table, code — пропускаем как не заголовочные
+            if tag in ('table', 'code'):
+                continue
+            # Прочие элементы — пробуем получить текст
+            text = get_text_content(child)
+            text = text.strip()
+            if text:
+                return self._smart_trim_inferred_title(text)
+        return ''
+
     def _section_title(self, section):
         """Нормализованный текст заголовка секции ('' если заголовка нет)."""
         title_el = fb2_find(section, 'title')
-        if title_el is None:
-            return ''
-        return ' '.join(get_text_content(title_el).split())
+        if title_el is not None:
+            t = ' '.join(get_text_content(title_el).split())
+            if t:
+                return t
+        t = self._infer_section_title(section)
+        if not t:
+            return '***'
+        return t
 
     def _section_has_own_content(self, section):
         """Есть ли у секции собственный текст (помимо заголовка и вложенных секций)."""
@@ -846,7 +926,7 @@ th {
 
         content = self.converter.convert_section(section, level, split)
         if not title:
-            title = f'Глава {self.chapter_idx}'
+            title = '***'
         self._add_chapter(title, content, [(title, None)])
         for kid in pending:
             self._add_section_files(kid, level + 1)
