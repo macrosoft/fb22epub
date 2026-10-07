@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from fb22epub import convert_fb2_to_epub
+from fb22epub import convert_fb2_to_epub, has_cover, load_cover_image
 
 SUPPORTED_EXTENSIONS = ('.fb2', '.zip')
 
@@ -46,6 +46,28 @@ def pick_file(files):
             return path
         print(f'Not found: {choice}')
 
+def ask_cover(src):
+    """Offers to attach a custom cover image. Returns a path or None."""
+    if has_cover(src):
+        print('\nThis book already has a cover.')
+        choice = input('Replace it with your own image? Path to image, or Enter to keep: ')
+    else:
+        print('\nNo cover found in this book.')
+        choice = input('Enter a path to a cover image (PNG, JPEG, WebP, AVIF...), or Enter to skip: ')
+    choice = choice.strip().strip('"').strip("'")
+    while choice:
+        path = Path(choice).expanduser()
+        if not path.is_file():
+            print(f'Not found: {choice}')
+        else:
+            try:
+                load_cover_image(path)
+                return path
+            except Exception as e:
+                print(f'Cannot use this image: {e}')
+        choice = input('Try another path, or Enter to skip: ').strip().strip('"').strip("'")
+    return None
+
 def main():
     input_dir = Path('input')
     output_dir = Path('output')
@@ -64,9 +86,10 @@ def main():
         src = pick_file(files)
         if src is None:
             return
+        cover = ask_cover(src)
         dst = output_dir / output_name(src)
         try:
-            convert_fb2_to_epub(src, dst)
+            convert_fb2_to_epub(src, dst, cover_path=cover)
             print(f'\nDone: {src.name} -> {dst.name}')
         except Exception as e:
             print(f'\nConversion failed for {src.name}: {e}')

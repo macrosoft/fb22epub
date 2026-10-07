@@ -11,7 +11,7 @@ Convert FictionBook (FB2) e-books to EPUB 3 format with a single Python script.
 - **EPUB 3 output**: valid EPUB 3 package (OPF, XHTML content documents, `nav.xhtml` TOC, `container.xml`).
 - **Zero dependencies**: pure standard library baseline; `lxml` (faster parsing) and `Pillow` (image dimensions) are used only if installed.
 - **Metadata**: title, authors, language, genre, date, publisher, ISBN, and series name/number are carried over into the OPF metadata.
-- **Cover**: creates a cover page with an SVG wrapper that preserves the image aspect ratio; marks the cover in the manifest with `cover-image`.
+- **Cover**: creates a cover page with an SVG wrapper that preserves the image aspect ratio; marks the cover in the manifest with `cover-image`. You can also attach your own cover image (even when the book has none).
 - **Images**: embedded and binary-linked images are extracted to `images/`; when duplicate ids exist, the highest-quality copy wins.
 - **Image dimension sniffing** without Pillow: built-in parsers for PNG, GIF, JPEG, WebP, and BMP.
 - **Structure**: chapters, sub-chapters, epigraphs, annotations, poems, quotes, tables, code blocks, subtitles, and notes (footnotes) are converted to styled XHTML.
@@ -34,8 +34,15 @@ pip install lxml Pillow
 ## Usage
 
 ```bash
-python fb22epub.py <input.fb2> [output.epub]
+python fb22epub.py <input.fb2> [output.epub] [--cover <image>]
 ```
+
+`--cover` / `-c` sets your own cover image. PNG, JPEG, GIF, and WebP are embedded as-is;
+AVIF, HEIC, BMP, TIFF, and anything else Pillow can open are converted to JPEG
+(PNG when the image has transparency), because EPUB readers don't support those formats.
+AVIF/HEIC decoding requires Pillow 11.2+ (`pip install --upgrade Pillow`).
+If the book already had a cover, it is replaced (and dropped from the output unless
+it is also used inside the text).
 
 If `output.epub` is omitted, the output is written next to the input with the same name and a `.epub` extension.
 
@@ -51,13 +58,24 @@ python convert.py
 
 The tool lists all `.fb2`/`.zip` files found in `input/` (created automatically on first run). Enter a file number to convert it, or type a path to a file anywhere. After each conversion it returns to the list; type `q` to quit.
 
+If the selected book has no cover, the tool offers to point at an image file to use as
+a cover (PNG, JPEG, AVIF, WebP... — the path can be pasted with quotes, e.g. dragged
+from Explorer). If the book already has a cover, it offers to replace it. Press Enter to
+skip. Invalid or unreadable images are rejected right away with a reason, so you can try
+another file.
+
 ## As a script
 
 ```python
 from fb22epub import convert_fb2_to_epub
 
 convert_fb2_to_epub("book.fb2", "book.epub")
+convert_fb2_to_epub("book.fb2", "book.epub", cover_path="cover.avif")
 ```
+
+There are also helpers: `has_cover("book.fb2")` returns whether the book has a cover,
+and `load_cover_image("cover.avif")` loads/converts an image to an EPUB-friendly format
+without converting the book.
 
 ## Examples
 

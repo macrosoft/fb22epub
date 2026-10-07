@@ -126,6 +126,20 @@ def _webp_size(data):
         return (w, h)
     return (None, None)
 
+def _read_fb2_root(filepath):
+    """Читает FB2 (или .zip с FB2 внутри) и возвращает корень XML."""
+    filepath = str(filepath)
+    if filepath.lower().endswith('.zip'):
+        with zipfile.ZipFile(filepath, 'r') as z:
+            for name in z.namelist():
+                if name.lower().endswith('.fb2'):
+                    data = z.read(name)
+                    break
+            else:
+                data = z.read(z.namelist()[0])
+        return ET.fromstring(data)
+    return ET.parse(filepath).getroot()
+
 def fb2_find(element, path):
     """Поиск элемента с учётом пространства имён FB2."""
     parts = path.split('/')
@@ -180,20 +194,7 @@ class FB2Book:
 
     def parse(self, filepath):
         """Парсинг FB2-файла."""
-        if filepath.endswith('.zip'):
-            import zipfile as zf
-            with zf.ZipFile(filepath, 'r') as z:
-                for name in z.namelist():
-                    if name.lower().endswith('.fb2'):
-                        data = z.read(name)
-                        break
-                else:
-                    data = z.read(z.namelist()[0])
-            tree = ET.ElementTree(ET.fromstring(data))
-        else:
-            tree = ET.parse(filepath)
-        
-        root = tree.getroot()
+        root = _read_fb2_root(filepath)
         self._parse_description(root)
         self._parse_bodies(root)
         self._parse_binaries(root)
@@ -1233,9 +1234,136 @@ th {
         text = text.replace("'", '&apos;')
         return text
 
-def convert_fb2_to_epub(input_path, output_path=None):
+# Форматы обложек, которые EPUB-ридеры понимают нативно
+COVER_NATIVE_FORMATS = {
+    'png': 'image/png',
+    'jpg': 'image/jpeg',
+    'gif': 'image/gif',
+    'webp': 'image/webp',
+}
+
+def _sniff_image_format(data):
+    """Формат картинки по magic bytes: png/jpg/gif/webp/bmp/avif/heic/tiff или None."""
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'png'
+    if data[:2] == b'\xff\xd8':
+        return 'jpg'
+    if data[:6] in (b'GIF87a', b'GIF89a'):
+        return 'gif'
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'webp'
+    if data[:2] == b'BM' and len(data) >= 26:
+        return 'bmp'
+    if data[4:8] == b'ftyp':
+        blob = data[:64]
+        if b'avif' in blob or b'avis' in blob:
+            return 'avif'
+        if any(b in blob for b in (b'heic', b'heix', b'heim', b'hevc', b'hevm', b'heis')):
+            return 'heic'
+    if data[:4] in (b'II*\x00', b'MM\x00*'):
+        return 'tiff'
+    return None
+
+def load_cover_image(path):
+    """Читает файл обложки и возвращает (data, content_type).
+
+    PNG/JPEG/GIF/WebP возвращаются как есть — ридеры их понимают.
+    Остальные форматы (AVIF, HEIC, BMP, TIFF...) конвертируются через
+    Pillow в JPEG (или PNG, если есть прозрачность), так как EPUB-ридеры
+    их не поддерживают.
+    """
+    path = Path(path)
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        raise ValueError(f'не удалось прочитать файл обложки: {e}')
+
+    fmt = _sniff_image_format(data)
+    content_type = COVER_NATIVE_FORMATS.get(fmt)
+    if content_type:
+        w, h = _sniff_image_size(data)
+        if w and h:
+            return data, content_type
+
+    try:
+        from PIL import Image
+    except ImportError:
+        raise ValueError(
+            f'формат "{fmt or "неизвестный"}" нужно конвертировать — установите Pillow: '
+            'pip install Pillow')
+    try:
+        im = Image.open(BytesIO(data))
+        im.load()
+    except Exception as e:
+        hint = ''
+        if fmt in ('avif', 'heic'):
+            hint = f' ({fmt.upper()} умеет читать Pillow 11.2+: pip install --upgrade Pillow)'
+        raise ValueError(f'не удалось открыть картинку "{path.name}": {e}{hint}')
+
+    has_alpha = im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info)
+    buf = BytesIO()
+    if has_alpha:
+        im.convert('RGBA').save(buf, 'PNG', optimize=True)
+        return buf.getvalue(), 'image/png'
+    im.convert('RGB').save(buf, 'JPEG', quality=90, optimize=True)
+    return buf.getvalue(), 'image/jpeg'
+
+def attach_custom_cover(book, cover_path):
+    """Ставит указанную картинку обложкой книги, заменяя штатную."""
+    data, content_type = load_cover_image(cover_path)
+    old_id = book.coverpage_image_id
+
+    cover_id = 'custom-cover'
+    n = 1
+    while cover_id in book.binaries:
+        n += 1
+        cover_id = f'custom-cover{n}'
+    book.binaries[cover_id] = (content_type, data)
+
+    # Старый файл обложки больше не нужен, если на него нет ссылок в тексте
+    if old_id and old_id != cover_id and old_id in book.binaries:
+        referenced = set()
+        for body in [book.body_element] + list(book.extra_bodies):
+            if body is None:
+                continue
+            for el in body.iter():
+                href = el.get(f'{{{XLINK_NS}}}href', '')
+                if href.startswith('#'):
+                    referenced.add(href[1:])
+        if old_id not in referenced:
+            del book.binaries[old_id]
+
+    book.coverpage_image_id = cover_id
+
+def has_cover(filepath):
+    """Есть ли у книги обложка (coverpage/image со ссылкой на существующий binary)."""
+    try:
+        root = _read_fb2_root(filepath)
+    except Exception:
+        return False
+    coverpage = fb2_find(root, 'description/title-info/coverpage')
+    if coverpage is None:
+        return False
+    image = fb2_find(coverpage, 'image')
+    if image is None:
+        return False
+    href = image.get(f'{{{XLINK_NS}}}href', '')
+    if href.startswith('#'):
+        href = href[1:]
+    if not href:
+        return False
+    for binary in fb2_findall(root, 'binary'):
+        if binary.get('id', '') == href and (binary.text or '').strip():
+            return True
+    return False
+
+def convert_fb2_to_epub(input_path, output_path=None, cover_path=None):
     """
     Конвертирует FB2-файл в EPUB 3.
+
+    cover_path — необязательный путь к своей обложке (PNG, JPEG, AVIF,
+    HEIC, WebP...). Если задан, картинка становится обложкой книги
+    вместо штатной.
     """
     input_path = str(input_path)
     if output_path is None:
@@ -1243,10 +1371,16 @@ def convert_fb2_to_epub(input_path, output_path=None):
         if base.endswith('.fb2'):
             base = base[:-4]
         output_path = base + '.epub'
-        
+
     print(f'Чтение: {input_path}')
     book = FB2Book()
     book.parse(input_path)
+    if cover_path:
+        attach_custom_cover(book, cover_path)
+        binary = book.binaries[book.coverpage_image_id]
+        w, h = _image_dimensions(binary[1])
+        size_str = f'{w}x{h}, ' if w and h else ''
+        print(f'Своя обложка: {cover_path} ({size_str}{binary[0]})')
     print(f'Название: {book.title}')
     print(f'Автор(ы): {", ".join(book.authors)}')
     print(f'Язык: {book.lang}')
@@ -1259,19 +1393,41 @@ def convert_fb2_to_epub(input_path, output_path=None):
 
 def main():
     """Точка входа CLI."""
-    if len(sys.argv) < 2:
-        print('Использование: python fb2epub.py <input.fb2> [output.epub]')
+    args = sys.argv[1:]
+    cover_path = None
+    positional = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ('--cover', '-c'):
+            i += 1
+            if i >= len(args):
+                print('Ошибка: после --cover нужен путь до файла обложки')
+                sys.exit(1)
+            cover_path = args[i]
+        elif a.startswith('--cover='):
+            cover_path = a.split('=', 1)[1]
+        else:
+            positional.append(a)
+        i += 1
+
+    if not positional:
+        print('Использование: python fb22epub.py <input.fb2> [output.epub] [--cover cover.jpg]')
+        print('  --cover, -c  путь к своей обложке (PNG, JPEG, WebP, AVIF, HEIC...)')
         sys.exit(1)
 
-    input_path = sys.argv[1]
-    output_path = sys.argv[2] if len(sys.argv) > 2 else None
+    input_path = positional[0]
+    output_path = positional[1] if len(positional) > 1 else None
 
     if not os.path.exists(input_path):
         print(f'Ошибка: файл не найден: {input_path}')
         sys.exit(1)
+    if cover_path and not os.path.isfile(cover_path):
+        print(f'Ошибка: обложка не найдена: {cover_path}')
+        sys.exit(1)
 
     try:
-        result = convert_fb2_to_epub(input_path, output_path)
+        result = convert_fb2_to_epub(input_path, output_path, cover_path=cover_path)
         print(f'Готово!')
     except Exception as e:
         print(f'Ошибка конвертации: {e}')
