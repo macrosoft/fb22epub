@@ -356,10 +356,6 @@ class FB2ToXHTMLConverter:
         for epigraph in fb2_findall(section, 'epigraph'):
             lines.append(self._convert_epigraph(epigraph))
 
-        # Изображение секции
-        for image in fb2_findall(section, 'image'):
-            lines.append(self._convert_image(image))
-
         # Аннотация секции
         annotation = fb2_find(section, 'annotation')
         if annotation is not None:
@@ -368,8 +364,12 @@ class FB2ToXHTMLConverter:
         # Содержимое секции
         for child in section:
             tag = self._local_tag(child)
-            if tag in ('title', 'epigraph', 'image', 'annotation'):
+            if tag in ('title', 'epigraph', 'annotation'):
                 continue
+            elif tag == 'image':
+                # Блочные картинки вставляются в документном порядке,
+                # а не поднимаются в начало секции.
+                lines.append(self._convert_image(child))
             elif tag == 'section':
                 if split is not None and split(child, level + 1):
                     continue
