@@ -344,28 +344,31 @@ class FB2ToXHTMLConverter:
         код берёт её на себя (отдельный файл главы).
         """
         lines = []
-        title_text = ''
 
-        # Обработка заголовка секции
+        # Заголовок секции
         title_el = fb2_find(section, 'title')
         if title_el is not None:
-            title_text = self._convert_title(title_el, level)
-            lines.append(title_text)
+            lines.append(self._convert_title(title_el, level))
 
-        # Эпиграф секции
-        for epigraph in fb2_findall(section, 'epigraph'):
-            lines.append(self._convert_epigraph(epigraph))
+        lines.extend(self._convert_children(list(section), level, split))
+        return '\n'.join(lines)
 
-        # Аннотация секции
-        annotation = fb2_find(section, 'annotation')
-        if annotation is not None:
-            lines.append(self._convert_annotation(annotation))
+    def _convert_children(self, children, level=1, split=None):
+        """Конвертация списка элементов FB2 в список XHTML-блоков.
 
-        # Содержимое секции
-        for child in section:
+        Порядок документа сохраняется. Используется и для содержимого
+        секции целиком, и для произвольной группы её детей — например,
+        куска между двумя <subtitle>-главами.
+        """
+        lines = []
+        for child in children:
             tag = self._local_tag(child)
-            if tag in ('title', 'epigraph', 'annotation'):
+            if tag == 'title':
                 continue
+            elif tag == 'epigraph':
+                lines.append(self._convert_epigraph(child))
+            elif tag == 'annotation':
+                lines.append(self._convert_annotation(child))
             elif tag == 'image':
                 # Блочные картинки вставляются в документном порядке,
                 # а не поднимаются в начало секции.
@@ -394,7 +397,7 @@ class FB2ToXHTMLConverter:
                 if text.strip():
                     lines.append(f'<p>{self._escape(text)}</p>')
 
-        return '\n'.join(lines)
+        return lines
 
     def _convert_title(self, title_el, level=1, anchor=''):
         """Конвертация заголовка."""
@@ -410,9 +413,14 @@ class FB2ToXHTMLConverter:
         id_attr = f' id="{anchor}"' if anchor else ''
         return f'<h{h_level}{id_attr}>{text}</h{h_level}>'
 
-    def _convert_subtitle(self, el):
-        """Конвертация подзаголовка."""
-        return f'<h4 class="subtitle">{self._inline_content(el)}</h4>'
+    def _convert_subtitle(self, el, level=None):
+        """Конвертация подзаголовка.
+
+        level задаётся только когда <subtitle> — это заголовок отдельной
+        главы-файла: такой подзаголовок становится h1/h2, а не h4.
+        """
+        h_level = min(level, 6) if level else 4
+        return f'<h{h_level} class="subtitle">{self._inline_content(el)}</h{h_level}>'
 
     def _convert_epigraph(self, epigraph):
         """Конвертация эпиграфа."""
@@ -874,6 +882,39 @@ th {
                 return True
         return False
 
+    def _subtitle_text(self, el):
+        """Нормализованный текст <subtitle>."""
+        return ' '.join(get_text_content(el).split())
+
+    def _is_chapter_subtitle(self, el):
+        """Является ли <subtitle> границей главы, а не разделителем сцен.
+
+        «* * *», «—», «***» — сценические паузы, книгу на них не режем.
+        Номера («1», «2») и слова («Благодарности») — это главы.
+        """
+        text = self._subtitle_text(el)
+        if not text:
+            return False
+        return re.fullmatch(r'[\W_]+', text) is None
+
+    def _has_subtitle_chapters(self, section):
+        """Есть ли в секции главы, заданные <subtitle>.
+
+        Условия намеренно строгие: секция без собственного <title> и без
+        вложенных <section>, то есть сплошной неозаглавленный текст, где
+        единственная разметка глав — <subtitle>. Книги с настоящими
+        секциями-главами (azkaban и подобные) при этом не меняются.
+        """
+        if fb2_find(section, 'title') is not None:
+            return False
+        for child in section:
+            tag = self.converter._local_tag(child)
+            if tag == 'section':
+                return False
+            if tag == 'subtitle' and self._is_chapter_subtitle(child):
+                return True
+        return False
+
     def _can_split(self, section, level):
         """Можно ли вынести секцию в отдельный файл главы."""
         if level > self.MAX_SPLIT_LEVEL or level < 2:
@@ -958,9 +999,47 @@ th {
         self.manifest_items.append((stem, f'{stem}.xhtml', 'application/xhtml+xml', ''))
         self.spine_items.append((stem, f'{stem}.xhtml'))
 
-    def _add_section_files(self, section, level):
+    def _add_subtitle_files(self, section, level, frontmatter_parts=None):
+        """Нарезка плоской секции по <subtitle>-главам: каждая — свой файл.
+
+        Заголовок главы и пункт оглавления — ровно текст <subtitle>,
+        без выдуманных подписей. Всё, что идёт до первой главы
+        (копирайт, эпиграф, приглашение), остаётся вступлением.
+        """
+        children = list(section)
+        starts = [i for i, child in enumerate(children)
+                  if self.converter._local_tag(child) == 'subtitle'
+                  and self._is_chapter_subtitle(child)]
+
+        prefix = ''
+        preamble = children[:starts[0]]
+        if preamble:
+            content = '\n'.join(self.converter._convert_children(preamble, level))
+            if frontmatter_parts is not None:
+                frontmatter_parts.append(content)
+            else:
+                # Вложенная секция: вступление приклеивается к первой главе.
+                prefix = content + '\n'
+
+        for n, start in enumerate(starts):
+            end = starts[n + 1] if n + 1 < len(starts) else len(children)
+            group = children[start:end]
+            title = self._subtitle_text(group[0])
+            content = self.converter._convert_subtitle(group[0], level) + '\n' \
+                + '\n'.join(self.converter._convert_children(group[1:], level))
+            if n == 0 and prefix:
+                content = prefix + content
+            self._add_chapter(title, content, [(title, None)])
+
+    def _add_section_files(self, section, level, frontmatter_parts=None):
         """Файлы для секции и всех вложенных секций, которые уходят в отдельные файлы."""
         kids = [c for c in section if self.converter._local_tag(c) == 'section']
+
+        # Плоская секция без заголовка: главы помечены <subtitle>.
+        if not kids and self._has_subtitle_chapters(section):
+            self._add_subtitle_files(section, level, frontmatter_parts)
+            return
+
         splittable = [c for c in kids if self._can_split(c, level + 1)]
         parts = [c for c in kids if c not in splittable
                  and self._is_transparent_part(c, level)]
@@ -1008,12 +1087,16 @@ th {
         found_first_title = False
 
         for section in self.book.sections:
-            if fb2_find(section, 'title') is None and not found_first_title:
+            if fb2_find(section, 'title') is None and not found_first_title \
+                    and not self._has_subtitle_chapters(section):
                 # Секция без заголовка в самом начале книги (титул, копирайт, аннотация)
                 frontmatter_parts.append(self.converter.convert_section(section, 1))
             else:
+                # Вступление следующей за frontmatter секции тоже кладём
+                # во frontmatter — но только пока мы в этой зоне книги.
+                parts = frontmatter_parts if not found_first_title else None
                 found_first_title = True
-                self._add_section_files(section, 1)
+                self._add_section_files(section, 1, parts)
 
         if not self.chapters and frontmatter_parts:
             # Если вообще нет заголовков, делаем всё одной главой
